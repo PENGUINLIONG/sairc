@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::iter::FromIterator;
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 enum Token<'a> {
@@ -137,17 +137,7 @@ impl<'a> Expression<'a> {
         self.cvals[i + 1]
     }
     pub fn get_name(&self, i: usize) -> Option<&'a str> {
-        if let ContextValue::Name(x) = self.cvals[i + 1] {
-            Some(x)
-        } else { None }
-    }
-    pub fn get_const(&self, i: usize) -> Option<Constant> {
-        if let ContextValue::Constant(x) = self.cvals[i + 1] {
-            Some(x)
-        } else { None }
-    }
-    pub fn get_ref(&self, i: usize) -> Option<ExpressionId> {
-        if let ContextValue::Reference(x) = self.cvals[i + 1] {
+        if let ContextValue::Name(x) = self.get_arg(i) {
             Some(x)
         } else { None }
     }
@@ -206,7 +196,7 @@ impl<'a> IntoIterator for Flow<'a> {
 }
 impl<'a> std::fmt::Debug for Flow<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Flow ");
+        write!(f, "Flow ")?;
         let mut x = f.debug_map();
         for (i, expr) in self.exprs.iter().enumerate() {
             x.entry(&i, expr);
@@ -223,8 +213,6 @@ static SRC: &'static str = r#"
 (type f32 (float 32))
 
 
-
-(seq matmul
 
 "Declare variables."
 (var M u32)
@@ -250,17 +238,12 @@ static SRC: &'static str = r#"
 (let C (arg 5 (tensor f32 M N)))
 
 "Loop and MatMul."
-(loop m (range 0 M 1)
-    (loop n (range 0 N 1)
-        (let temp 0.0)
-        (loop k (range 0 K 1)
-            (let temp (+ (* (load A m k) (load B k n)) temp))
-        )
-        (store temp C m n)
-    )
-)
-
-)
+(let m (range 0 M 1))
+(let n (range 0 N 1))
+(let k (range 0 K 1))
+(let temp 0.0)
+(let temp (recur temp (+ (* (load A m k) (load B k n)) temp)))
+(store temp C m n)
 "#;
 
 
@@ -293,8 +276,6 @@ struct ExpressionMeta<'a> {
 
 #[derive(Debug, Default)]
 struct ModuleManifest<'a> {
-    /// Mapping from sequence names to sequence descriptions.
-    seq_map: HashMap<&'a str, ExpressionId>,
     /// All expressions in this module and their metadata.
     exprs: Vec<ExpressionMeta<'a>>,
 }
@@ -320,13 +301,6 @@ impl<'a> ModuleManifest<'a> {
             .collect::<Vec<_>>();
         let iexpr = self.exprs.len();
 
-        // Register sequence.
-        if expr.op() == "seq" {
-            let seq_name = expr.get_name(0)
-                .expect("sequence name is missing");
-            self.seq_map.insert(seq_name, iexpr);
-        }
-
         // Assign parent ID to children.
         for arg in expr.args().iter() {
             if let ContextValue::Reference(ichild) = arg {
@@ -348,11 +322,11 @@ impl<'a> ModuleManifest<'a> {
 
 
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct NamespaceStackFrame<'a> {
-    bind_map: HashMap<&'a str, ExpressionId>,
+    bind_map: HashMap<&'a str, ContextValue<'a>>,
 }
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct NamespaceStack<'a> {
     ns_stack: Vec<NamespaceStackFrame<'a>>,
 }
@@ -367,23 +341,23 @@ impl<'a> NamespaceStack<'a> {
         use std::collections::hash_map::Entry::Vacant;
         let last_frame = self.ns_stack.last_mut().unwrap();
         if let Vacant(e) = last_frame.bind_map.entry(name) {
-            e.insert(INVALID_EXPRESSION);
+            e.insert(ContextValue::Reference(INVALID_EXPRESSION));
         }
     }
-    fn bind(&mut self, name: &'a str, iexpr: ExpressionId) {
+    fn bind(&mut self, name: &'a str, cval: ContextValue<'a>) {
         use std::collections::hash_map::Entry::Occupied;
         for frame in self.ns_stack.iter_mut().rev() {
             if let Occupied(mut e) = frame.bind_map.entry(name) {
-                e.insert(iexpr);
+                e.insert(cval);
                 return;
             }
         }
         panic!("name not yet declared");
     }
-    fn look_up(&self, name: &str) -> ExpressionId {
+    fn look_up(&self, name: &str) -> ContextValue<'a> {
         for frame in self.ns_stack.iter().rev() {
-            if let Some(iexpr) = frame.bind_map.get(name) {
-                return *iexpr;
+            if let Some(cval) = frame.bind_map.get(name) {
+                return *cval;
             }
         }
         panic!("name not yet bound")
@@ -400,8 +374,7 @@ impl<'a> ModuleManifest<'a> {
         ns_stack: &mut NamespaceStack<'a>,
         out_manifest: &mut ModuleManifest<'a>
     ) -> Option<ExpressionId> {
-        ns_stack.push();
-
+        let mut rv = None;
         match meta.expr.op() {
             "var" => {
                 let var_name = meta.expr.get_name(0)
@@ -411,74 +384,81 @@ impl<'a> ModuleManifest<'a> {
             "let" => {
                 let var_name = meta.expr.get_name(0)
                     .expect("name is missing in `let` op");
-                let iexpr = match meta.expr.get_arg(1) {
+
+                let cval = match meta.expr.get_arg(1) {
                     ContextValue::Name(name) => {
                         // The returned ID is already in the new context.
                         ns_stack.look_up(name)
                     },
+                    ContextValue::Constant(c) => ContextValue::Constant(c),
                     ContextValue::Reference(iexpr) => {
                         // This `iexpr` is in the old context in `self`.
                         // Flatten and transfer it to the new context.
-                        self.flatten_aliases_impl(&self.exprs[iexpr], ns_stack, out_manifest)
-                            .expect("reference failed")
+                        let out_iexpr = self.flatten_aliases_impl(&self.exprs[iexpr], ns_stack, out_manifest)
+                            .expect("reference failed");
+                        ContextValue::Reference(out_iexpr)
                     },
-                    _ => panic!("invalid context value in `let` op"),
                 };
 
-                ns_stack.bind(var_name, iexpr);
+                ns_stack.bind(var_name, cval);
             },
             "type" => {
                 let ty_name = meta.expr.get_name(0)
                     .expect("name is missing in `type` op");
-                let iexpr = match meta.expr.get_arg(1) {
+                let cval = match meta.expr.get_arg(1) {
                     ContextValue::Name(name) => {
                         ns_stack.look_up(name)
                     },
                     ContextValue::Reference(iexpr) => {
-                        self.flatten_aliases_impl(&self.exprs[iexpr], ns_stack, out_manifest)
-                            .expect("reference failed")
+                        let out_iexpr = self.flatten_aliases_impl(&self.exprs[iexpr], ns_stack, out_manifest)
+                            .expect("reference failed");
+                        ContextValue::Reference(out_iexpr)
                     },
                     _ => panic!("invalid context value in `type` op"),
                 };
                 ns_stack.declare(ty_name);
-                ns_stack.bind(ty_name, iexpr);
+                ns_stack.bind(ty_name, cval);
             },
-            // TODO: (penguinliong) Loop squeezing.
             _ => {
+                ns_stack.push();
+
                 let mut out_cvals = vec![ContextValue::Name(meta.expr.op())];
                 for arg in meta.expr.args() {
                     let out_cval = match arg {
                         ContextValue::Name(name) => {
-                            ContextValue::Reference(ns_stack.look_up(name))
+                            ns_stack.look_up(name)
                         },
-                        ContextValue::Constant(_) => { arg.clone() },
+                        ContextValue::Constant(c) => ContextValue::Constant(*c),
                         ContextValue::Reference(iexpr) => {
                             let child_expr = &self.exprs[*iexpr];
-                            let out_iexpr =
+                            if let Some(out_iexpr) =
                                 self.flatten_aliases_impl(child_expr, ns_stack, out_manifest)
-                                    .expect("reference failed");
-                            ContextValue::Reference(out_iexpr)
+                            {
+                                ContextValue::Reference(out_iexpr)
+                            } else {
+                                continue;
+                            }
                         },
                     };
 
                     out_cvals.push(out_cval);
                 }
                 let out_expr = Expression { cvals: out_cvals };
-                out_manifest.record_expr(out_expr);
+                rv = Some(out_manifest.record_expr(out_expr));
+
+                ns_stack.pop();
             }
         }
-        ns_stack.pop();
 
-        return None;
+        return rv;
     }
-    pub fn flatten_aliases(&self, iexpr: ExpressionId) -> ModuleManifest<'a> {
+    pub fn flatten_aliases(&self) -> ModuleManifest<'a> {
         let root_expr = self.exprs.last()
             .expect("empty manifest");
 
         let mut ns_stack = NamespaceStack::default();
         let mut out_manifest = ModuleManifest::default();
         self.flatten_aliases_impl(&root_expr, &mut ns_stack, &mut out_manifest);
-        out_manifest.exprs.reverse();
 
         out_manifest
     }
@@ -514,5 +494,6 @@ fn main() {
     //println!("{:?}", tokens);
     let flow = Flow::parse(tokens);
     let manifest = flow.into_iter().collect::<ModuleManifest<'_>>();
-    println!("{:#?}", manifest);
+    let flattened_manifest = manifest.flatten_aliases();
+    println!("{:#?}", flattened_manifest);
 }
