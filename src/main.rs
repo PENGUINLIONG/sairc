@@ -459,8 +459,39 @@ impl<'a> ModuleManifest<'a> {
         let mut ns_stack = NamespaceStack::default();
         let mut out_manifest = ModuleManifest::default();
         self.flatten_aliases_impl(&root_expr, &mut ns_stack, &mut out_manifest);
+        out_manifest.exprs.reverse();
 
         out_manifest
+    }
+
+    fn to_source_impl(&self, expr: &ExpressionMeta<'a>) -> String {
+        let mut out_source = String::new();
+        out_source.push_str("(");
+        let expr_lit = expr.expr.cvals.iter()
+            .map(|cval| {
+                match cval {
+                    ContextValue::Name(name) => {
+                        name.to_string()
+                    },
+                    ContextValue::Constant(c) => {
+                        format!("{:?}", c)
+                    },
+                    ContextValue::Reference(iexpr) => {
+                        let expr = self.exprs.get(*iexpr)
+                            .expect("broken reference");
+                        self.to_source_impl(expr)
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        out_source.push_str(&expr_lit.join(" "));
+        out_source.push_str(")");
+        out_source
+    }
+    /// Translate back to source.
+    pub fn to_source(&self) -> String {
+        let source = self.to_source_impl(self.exprs.last().unwrap());
+        source
     }
 }
 impl<'a> FromIterator<Expression<'a>> for ModuleManifest<'a> {
@@ -495,5 +526,6 @@ fn main() {
     let flow = Flow::parse(tokens);
     let manifest = flow.into_iter().collect::<ModuleManifest<'_>>();
     let flattened_manifest = manifest.flatten_aliases();
-    println!("{:#?}", flattened_manifest);
+    let flattened_source = flattened_manifest.to_source();
+    println!("{}", flattened_source);
 }
