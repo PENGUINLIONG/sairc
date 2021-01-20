@@ -1,6 +1,6 @@
 mod range;
+mod program;
 
-use std::rc::Rc;
 use range::{rng_to_idxer, Range, IntoRange};
 
 fn main() {
