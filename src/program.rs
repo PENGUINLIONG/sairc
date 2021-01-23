@@ -81,7 +81,7 @@ enum Command {
     Fence,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum DataAccessType {
     Intermediate,
     Input,
@@ -253,12 +253,33 @@ impl Program {
             },
             Command::Broadcast(cmd) => {
                 if let Some(src_data) = self.data_map.get_mut(&cmd.src_id) {
-                    let shape = src_data.clone();
                     let data = Data {
-                        shape,
-                    }
+                        name: format!("{}_b{}", src_data.name, cmd.dim_idx),
+                        shape: src_data.shape.clone(),
+                        access_ty: src_data.access_ty,
+                        ..Default::default()
+                    };
+                    self.insert_data(cmd.dst_id, data);
+                } else {
+                    panic!("source data is unassigned");
                 }
-            }
+            },
+            Command::Map(cmd) => {
+                if let Some(src_data) = self.data_map.get_mut(&cmd.src_id) {
+                    let data = Data {
+                        name: format!("{}_b{}", src_data.name, cmd.dim_idx),
+                        shape: src_data.shape.clone(),
+                        access_ty: src_data.access_ty,
+                        ..Default::default()
+                    };
+                    self.insert_data(cmd.dst_id, data);
+                } else {
+                    panic!("source data is unassigned");
+                }
+            },
+            Command::Reduce(cmd) => {
+
+            },
             _ => unimplemented!(),
         }
 
